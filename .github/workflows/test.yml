@@ -30,8 +30,4 @@ jobs:
         run: python -m playwright install chromium
 
       - name: Run unit tests
-        run: python -m pytest tests/ -v --ignore=tests/test_e2e.py
-
-      - name: Run e2e smoke test
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-        run: python -m pytest tests/test_e2e.py -v
+        run: python -m pytest tests/ -v

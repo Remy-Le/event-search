@@ -14,7 +14,7 @@ import random
 import re
 import sys
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional, TypedDict
 
 from playwright.async_api import async_playwright, Page, Browser
 
@@ -28,11 +28,23 @@ from config import (
     OUTPUT_FILE,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+class Event(TypedDict, total=False):
+    title: str
+    date: str
+    time: str
+    platform: str
+    link: str
+    venue: str
+    organizer: str
+    description: str
+    price: str
+    format: str
+    language: str
+    topic_tags: str
+    score: float
+    scraped_at: str
+
+
 logger = logging.getLogger(__name__)
 
 # ─── Stealth ───────────────────────────────────────────────────────────────────
@@ -84,7 +96,7 @@ def clean_text(text: str, max_len: int = 0) -> str:
     return text
 
 
-def detect_language(title: str, description: str) -> str:
+def detect_language(title: str, description: str) -> Literal["French", "English", ""]:
     text = (title + " " + description).lower()
     french_words = [
         "conference", "atelier", "rencontre", "presentation", "gratuit",
@@ -123,19 +135,163 @@ async def try_click_cookie_banner(page: Page):
                 await asyncio.sleep(0.5)
                 return
         except Exception:
+            logger.debug("Cookie banner selector failed: %s", pattern)
             continue
 
 
 async def safe_goto(page: Page, url: str, timeout: int = 30000) -> bool:
+    for attempt in range(2):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            await asyncio.sleep(random_delay(2, 4))
+            await try_click_cookie_banner(page)
+            await page.wait_for_load_state("networkidle", timeout=10000)
+            return True
+        except Exception as e:
+            logger.warning(f"Navigation failed: {url[:60]}... ({e})")
+            if attempt == 0:
+                delay = 2 ** (attempt + 2)
+                logger.info(f"Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+    return False
+
+
+# ─── Shared Extraction ─────────────────────────────────────────────────────────
+
+PLATFORM_SELECTORS: dict[str, dict[str, list[str]]] = {
+    "Meetup": {
+        "title": ["h1"],
+        "description": [
+            '[data-testid="event-description"]',
+            '[class*="description"]',
+            '[itemprop="description"]',
+            "main",
+            "article",
+        ],
+        "date": [
+            "time",
+            '[data-testid="event-time"]',
+            '[class*="dateTime"]',
+            '[class*="date"]',
+        ],
+        "venue": [
+            '[data-testid="venue"]',
+            '[class*="venue"]',
+            '[class*="location"]',
+        ],
+        "organizer": [
+            '[data-testid="group-name"]',
+            '[class*="groupName"]',
+            '[class*="organizer"]',
+            "a[href*='/groups/']",
+        ],
+        "price": [
+            '[class*="price"]',
+            '[class*="ticket"]',
+        ],
+    },
+    "Luma": {
+        "title": ["h1"],
+        "description": [
+            '[class*="description"]',
+            '[class*="content"]',
+            "main",
+            "article",
+        ],
+        "date": [
+            "time",
+            '[class*="date"]',
+            '[class*="time"]',
+            '[class*="schedule"]',
+        ],
+        "venue": [
+            '[class*="location"]',
+            '[class*="venue"]',
+            '[class*="address"]',
+        ],
+        "organizer": [
+            '[class*="host"]',
+            '[class*="organizer"]',
+            "a[href*='/calendar/']",
+        ],
+        "price": [
+            '[class*="price"]',
+            '[class*="ticket"]',
+        ],
+    },
+}
+
+
+async def _extract_field(
+    page: Page,
+    selectors: list[str],
+    max_len: int = 0,
+    min_len: int = 0,
+) -> str:
+    for sel in selectors:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                text = clean_text(await el.inner_text(), max_len)
+                if len(text) >= min_len:
+                    return text
+        except Exception:
+            continue
+    return ""
+
+
+async def extract_event(page: Page, url: str, platform: str) -> Optional[Event]:
+    event: Event = {
+        "title": "",
+        "date": "",
+        "time": "",
+        "platform": platform,
+        "link": url,
+        "venue": "",
+        "organizer": "",
+        "description": "",
+        "price": "",
+        "format": "",
+        "language": "",
+        "topic_tags": "",
+        "score": 0,
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    ok = await safe_goto(page, url, timeout=20000)
+    if not ok:
+        return None
+
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-        await asyncio.sleep(random_delay(2, 4))
-        await try_click_cookie_banner(page)
-        await page.wait_for_load_state("networkidle", timeout=10000)
-        return True
-    except Exception as e:
-        logger.warning(f"Navigation failed: {url[:60]}... ({e})")
-        return False
+        await page.wait_for_selector("h1", timeout=8000)
+    except Exception:
+        logger.debug("No h1 found on page: %s", url[:80])
+        pass
+
+    body = page
+    selectors = PLATFORM_SELECTORS[platform]
+
+    title = await _extract_field(body, selectors["title"], max_len=150)
+    if not title:
+        title = clean_text(await page.title(), 150)
+    event["title"] = title
+
+    event["description"] = await _extract_field(
+        body, selectors["description"], max_len=500, min_len=50
+    )
+    event["date"] = await _extract_field(body, selectors["date"], max_len=200)
+    event["venue"] = await _extract_field(body, selectors["venue"], max_len=100)
+    event["organizer"] = await _extract_field(
+        body, selectors["organizer"], max_len=100
+    )
+    event["price"] = await _extract_field(body, selectors["price"], max_len=50)
+    if not event["price"] and "free" in (
+        await body.inner_text("body")
+    ).lower()[:2000]:
+        event["price"] = "Free"
+
+    event["language"] = detect_language(event["title"], event["description"])
+    return event
 
 
 # ─── Scoring ──────────────────────────────────────────────────────────────────
@@ -223,7 +379,7 @@ async def scrape_meetup(page: Page) -> list[dict]:
                 continue
             seen_links.add(href)
 
-            event = await extract_meetup_event(page, href)
+            event = await extract_event(page, href, "Meetup")
             if event:
                 events.append(event)
 
@@ -236,125 +392,7 @@ async def scrape_meetup(page: Page) -> list[dict]:
     return events
 
 
-async def extract_meetup_event(page: Page, url: str) -> Optional[dict]:
-    event = {
-        "title": "",
-        "date": "",
-        "time": "",
-        "platform": "Meetup",
-        "link": url,
-        "venue": "",
-        "organizer": "",
-        "description": "",
-        "price": "",
-        "format": "",
-        "language": "",
-        "topic_tags": "",
-        "score": 0,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-    }
 
-    ok = await safe_goto(page, url, timeout=20000)
-    if not ok:
-        return event
-
-    try:
-        await page.wait_for_selector("h1", timeout=8000)
-    except Exception:
-        pass
-
-    body = page
-    # Title
-    try:
-        h1 = await body.query_selector("h1")
-        if h1:
-            event["title"] = clean_text(await h1.inner_text(), 150)
-    except Exception:
-        pass
-    if not event["title"]:
-        event["title"] = clean_text(await page.title(), 150)
-
-    # Description
-    for sel in [
-        '[data-testid="event-description"]',
-        '[class*="description"]',
-        '[itemprop="description"]',
-        "main",
-        "article",
-    ]:
-        try:
-            el = await body.query_selector(sel)
-            if el:
-                text = clean_text(await el.inner_text(), 500)
-                if len(text) > 50:
-                    event["description"] = text
-                    break
-        except Exception:
-            continue
-
-    # Date
-    for sel in [
-        "time",
-        '[data-testid="event-time"]',
-        '[class*="dateTime"]',
-        '[class*="date"]',
-    ]:
-        try:
-            el = await body.query_selector(sel)
-            if el:
-                dt = clean_text(await el.inner_text(), 200)
-                if dt:
-                    event["date"] = dt
-                    break
-        except Exception:
-            continue
-
-    # Venue
-    for sel in [
-        '[data-testid="venue"]',
-        '[class*="venue"]',
-        '[class*="location"]',
-    ]:
-        try:
-            el = await body.query_selector(sel)
-            if el:
-                event["venue"] = clean_text(await el.inner_text(), 100)
-                break
-        except Exception:
-            continue
-
-    # Organizer
-    for sel in [
-        '[data-testid="group-name"]',
-        '[class*="groupName"]',
-        '[class*="organizer"]',
-        "a[href*='/groups/']",
-    ]:
-        try:
-            el = await body.query_selector(sel)
-            if el:
-                event["organizer"] = clean_text(await el.inner_text(), 100)
-                break
-        except Exception:
-            continue
-
-    # Price
-    for sel in [
-        '[class*="price"]',
-        '[class*="ticket"]',
-    ]:
-        try:
-            el = await body.query_selector(sel)
-            if el:
-                event["price"] = clean_text(await el.inner_text(), 50)
-                break
-        except Exception:
-            continue
-    if "free" in (await body.inner_text("body")).lower()[:2000] and not event["price"]:
-        event["price"] = "Free"
-
-    event["language"] = detect_language(event["title"], event["description"])
-    return event
 
 
 # ─── Luma Scraper ─────────────────────────────────────────────────────────────
@@ -394,7 +432,7 @@ async def scrape_luma(page: Page) -> list[dict]:
             continue
         seen_links.add(href)
 
-        event = await extract_luma_event(page, href)
+        event = await extract_event(page, href, "Luma")
         if event:
             events.append(event)
 
@@ -406,117 +444,7 @@ async def scrape_luma(page: Page) -> list[dict]:
     return events
 
 
-async def extract_luma_event(page: Page, url: str) -> Optional[dict]:
-    event = {
-        "title": "",
-        "date": "",
-        "time": "",
-        "platform": "Luma",
-        "link": url,
-        "venue": "",
-        "organizer": "",
-        "description": "",
-        "price": "",
-        "format": "",
-        "language": "",
-        "topic_tags": "",
-        "score": 0,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-    }
 
-    ok = await safe_goto(page, url, timeout=20000)
-    if not ok:
-        return event
-
-    try:
-        await page.wait_for_selector("h1", timeout=8000)
-    except Exception:
-        pass
-
-    # Title
-    try:
-        h1 = await page.query_selector("h1")
-        if h1:
-            event["title"] = clean_text(await h1.inner_text(), 150)
-    except Exception:
-        pass
-    if not event["title"]:
-        event["title"] = clean_text(await page.title(), 150)
-
-    # Description
-    for sel in [
-        '[class*="description"]',
-        '[class*="content"]',
-        "main",
-        "article",
-    ]:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                text = clean_text(await el.inner_text(), 500)
-                if len(text) > 50:
-                    event["description"] = text
-                    break
-        except Exception:
-            continue
-
-    # Date
-    for sel in ["time", '[class*="date"]', '[class*="time"]', '[class*="schedule"]']:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                dt = clean_text(await el.inner_text(), 200)
-                if dt:
-                    event["date"] = dt
-                    break
-        except Exception:
-            continue
-
-    # Venue
-    for sel in [
-        '[class*="location"]',
-        '[class*="venue"]',
-        '[class*="address"]',
-    ]:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                event["venue"] = clean_text(await el.inner_text(), 100)
-                break
-        except Exception:
-            continue
-
-    # Organizer
-    for sel in [
-        '[class*="host"]',
-        '[class*="organizer"]',
-        "a[href*='/calendar/']",
-    ]:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                event["organizer"] = clean_text(await el.inner_text(), 100)
-                break
-        except Exception:
-            continue
-
-    # Price
-    for sel in [
-        '[class*="price"]',
-        '[class*="ticket"]',
-    ]:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                event["price"] = clean_text(await el.inner_text(), 50)
-                break
-        except Exception:
-            continue
-    if "free" in (await page.inner_text("body")).lower()[:2000] and not event["price"]:
-        event["price"] = "Free"
-
-    event["language"] = detect_language(event["title"], event["description"])
-    return event
 
 
 # ─── CSV ops ───────────────────────────────────────────────────────────────────
@@ -596,6 +524,11 @@ def print_summary(all_events: list[dict]):
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     logger.info("=" * 50)
     logger.info("Paris Events Scraper starting")
     logger.info(f"Keywords: {', '.join(SEARCH_KEYWORDS)}")
