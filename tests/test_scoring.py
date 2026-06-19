@@ -1,8 +1,5 @@
 import pytest
-import sys
-sys.path.insert(0, ".")
-
-from scraper import score_event, detect_language, clean_text
+from scoring import score_event, detect_language, clean_text
 
 
 class TestCleanText:

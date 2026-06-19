@@ -10,330 +10,16 @@ import asyncio
 import csv
 import logging
 import os
-import random
-import re
 import sys
-from datetime import datetime, timezone
-from typing import Literal, Optional, TypedDict
 
-from playwright.async_api import async_playwright, Page, Browser
+from playwright.async_api import async_playwright, Page
 
-from config import (
-    SEARCH_KEYWORDS,
-    PARIS_LOCATION,
-    INTERESTS,
-    FORMATS,
-    SCORING,
-    CSV_COLUMNS,
-    OUTPUT_FILE,
-)
-
-class Event(TypedDict, total=False):
-    title: str
-    date: str
-    time: str
-    platform: str
-    link: str
-    venue: str
-    organizer: str
-    description: str
-    price: str
-    format: str
-    language: str
-    topic_tags: str
-    score: float
-    scraped_at: str
-
+from config import SEARCH_KEYWORDS, CSV_COLUMNS, OUTPUT_FILE
+from browser import create_context, safe_goto, extract_event, random_delay
+from scoring import score_event
 
 logger = logging.getLogger(__name__)
 
-# ─── Stealth ───────────────────────────────────────────────────────────────────
-
-STEALTH_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => false });
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5],
-});
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en'],
-});
-Object.defineProperty(navigator, 'platform', {
-    get: () => 'Win32',
-});
-"""
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-]
-
-
-def random_delay(min_s: float = 2.0, max_s: float = 5.0) -> float:
-    return random.uniform(min_s, max_s)
-
-
-async def create_context(browser: Browser):
-    context = await browser.new_context(
-        user_agent=random.choice(USER_AGENTS),
-        viewport={
-            "width": random.randint(1280, 1440),
-            "height": random.randint(800, 900),
-        },
-        locale="en-US",
-        timezone_id="Europe/Paris",
-    )
-    await context.add_init_script(STEALTH_SCRIPT)
-    return context
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def clean_text(text: str, max_len: int = 0) -> str:
-    text = re.sub(r'\s+', ' ', text).strip()
-    if max_len and len(text) > max_len:
-        text = text[:max_len] + "..."
-    return text
-
-
-def detect_language(title: str, description: str) -> Literal["French", "English", ""]:
-    text = (title + " " + description).lower()
-    french_words = [
-        "conference", "atelier", "rencontre", "presentation", "gratuit",
-        "inscription", "bonjour", "programme", "intervenant", "participer",
-    ]
-    english_words = [
-        "workshop", "talk", "meetup", "register", "rsvp",
-        "learn", "join", "welcome", "speaker", "attend",
-    ]
-    fr_score = sum(1 for w in french_words if re.search(rf'(?<![a-z]){w}(?![a-z])', text))
-    en_score = sum(1 for w in english_words if re.search(rf'(?<![a-z]){w}(?![a-z])', text))
-    if fr_score > en_score:
-        return "French"
-    elif en_score > fr_score:
-        return "English"
-    return ""
-
-
-async def try_click_cookie_banner(page: Page):
-    """Accept cookie banners if present."""
-    patterns = [
-        "button:has-text('Accept')",
-        "button:has-text('Accepter')",
-        "button:has-text('Accept all')",
-        "button:has-text('Tout accepter')",
-        "button:has-text('Got it')",
-        "button:has-text('OK')",
-        '[aria-label*="cookie"] button',
-        '[class*="cookie"] button',
-    ]
-    for pattern in patterns:
-        try:
-            btn = await page.query_selector(pattern)
-            if btn:
-                await btn.click()
-                await asyncio.sleep(0.5)
-                return
-        except Exception:
-            logger.debug("Cookie banner selector failed: %s", pattern)
-            continue
-
-
-async def safe_goto(page: Page, url: str, timeout: int = 30000) -> bool:
-    for attempt in range(2):
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-            await asyncio.sleep(random_delay(2, 4))
-            await try_click_cookie_banner(page)
-            await page.wait_for_load_state("networkidle", timeout=10000)
-            return True
-        except Exception as e:
-            logger.warning(f"Navigation failed: {url[:60]}... ({e})")
-            if attempt == 0:
-                delay = 2 ** (attempt + 2)
-                logger.info(f"Retrying in {delay}s...")
-                await asyncio.sleep(delay)
-    return False
-
-
-# ─── Shared Extraction ─────────────────────────────────────────────────────────
-
-PLATFORM_SELECTORS: dict[str, dict[str, list[str]]] = {
-    "Meetup": {
-        "title": ["h1"],
-        "description": [
-            '[data-testid="event-description"]',
-            '[class*="description"]',
-            '[itemprop="description"]',
-            "main",
-            "article",
-        ],
-        "date": [
-            "time",
-            '[data-testid="event-time"]',
-            '[class*="dateTime"]',
-            '[class*="date"]',
-        ],
-        "venue": [
-            '[data-testid="venue"]',
-            '[class*="venue"]',
-            '[class*="location"]',
-        ],
-        "organizer": [
-            '[data-testid="group-name"]',
-            '[class*="groupName"]',
-            '[class*="organizer"]',
-            "a[href*='/groups/']",
-        ],
-        "price": [
-            '[class*="price"]',
-            '[class*="ticket"]',
-        ],
-    },
-    "Luma": {
-        "title": ["h1"],
-        "description": [
-            '[class*="description"]',
-            '[class*="content"]',
-            "main",
-            "article",
-        ],
-        "date": [
-            "time",
-            '[class*="date"]',
-            '[class*="time"]',
-            '[class*="schedule"]',
-        ],
-        "venue": [
-            '[class*="location"]',
-            '[class*="venue"]',
-            '[class*="address"]',
-        ],
-        "organizer": [
-            '[class*="host"]',
-            '[class*="organizer"]',
-            "a[href*='/calendar/']",
-        ],
-        "price": [
-            '[class*="price"]',
-            '[class*="ticket"]',
-        ],
-    },
-}
-
-
-async def _extract_field(
-    page: Page,
-    selectors: list[str],
-    max_len: int = 0,
-    min_len: int = 0,
-) -> str:
-    for sel in selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                text = clean_text(await el.inner_text(), max_len)
-                if len(text) >= min_len:
-                    return text
-        except Exception:
-            continue
-    return ""
-
-
-async def extract_event(page: Page, url: str, platform: str) -> Optional[Event]:
-    event: Event = {
-        "title": "",
-        "date": "",
-        "time": "",
-        "platform": platform,
-        "link": url,
-        "venue": "",
-        "organizer": "",
-        "description": "",
-        "price": "",
-        "format": "",
-        "language": "",
-        "topic_tags": "",
-        "score": 0,
-        "scraped_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    ok = await safe_goto(page, url, timeout=20000)
-    if not ok:
-        return None
-
-    try:
-        await page.wait_for_selector("h1", timeout=8000)
-    except Exception:
-        logger.debug("No h1 found on page: %s", url[:80])
-        pass
-
-    body = page
-    selectors = PLATFORM_SELECTORS[platform]
-
-    title = await _extract_field(body, selectors["title"], max_len=150)
-    if not title:
-        title = clean_text(await page.title(), 150)
-    event["title"] = title
-
-    event["description"] = await _extract_field(
-        body, selectors["description"], max_len=500, min_len=50
-    )
-    event["date"] = await _extract_field(body, selectors["date"], max_len=200)
-    event["venue"] = await _extract_field(body, selectors["venue"], max_len=100)
-    event["organizer"] = await _extract_field(
-        body, selectors["organizer"], max_len=100
-    )
-    event["price"] = await _extract_field(body, selectors["price"], max_len=50)
-    if not event["price"] and "free" in (
-        await body.inner_text("body")
-    ).lower()[:2000]:
-        event["price"] = "Free"
-
-    event["language"] = detect_language(event["title"], event["description"])
-    return event
-
-
-# ─── Scoring ──────────────────────────────────────────────────────────────────
-
-def score_event(event: dict) -> dict:
-    text = f"{event.get('title', '')} {event.get('description', '')}".lower()
-
-    topic_score = 0
-    matched_topics = []
-    for category, config in INTERESTS.items():
-        for kw in config["keywords"]:
-            if re.search(rf'(?<![a-z]){re.escape(kw.lower())}(?![a-z])', text):
-                topic_score += config["weight"]
-                matched_topics.append(category)
-                break
-
-    topic_score = min(topic_score, SCORING["topic_max"])
-
-    format_score = 0
-    detected_formats = []
-    for fmt, config in FORMATS.items():
-        for kw in config["keywords"]:
-            if re.search(rf'(?<![a-z]){re.escape(kw.lower())}(?![a-z])', text):
-                format_score += config["bonus"]
-                detected_formats.append(fmt)
-                break
-
-    format_score = min(format_score, SCORING["format_max"])
-
-    desc = event.get("description", "") or ""
-    desc_score = min(len(desc) / 200, 1.0) * SCORING["description_max"]
-
-    total = round(topic_score + format_score + desc_score, 1)
-
-    event["topic_tags"] = ", ".join(matched_topics) if matched_topics else ""
-    event["format"] = ", ".join(detected_formats) if detected_formats else ""
-    event["score"] = total
-
-    return event
-
-
-# ─── Meetup Scraper ───────────────────────────────────────────────────────────
 
 async def scrape_meetup(page: Page) -> list[dict]:
     events = []
@@ -355,13 +41,11 @@ async def scrape_meetup(page: Page) -> list[dict]:
 
         await asyncio.sleep(random_delay(3, 6))
 
-        # detect signup wall
         page_text = await page.inner_text("body")
         if "sign up" in page_text.lower() and "event" not in page_text.lower()[:500]:
             logger.warning("Meetup: signup wall detected, skipping")
             continue
 
-        # collect event links
         links = await page.eval_on_selector_all(
             "a[href*='/events/']",
             "els => els.map(el => ({href: el.href, text: el.innerText.trim()}))",
@@ -383,7 +67,6 @@ async def scrape_meetup(page: Page) -> list[dict]:
             if event:
                 events.append(event)
 
-    # sort unique by score descending
     for e in events:
         score_event(e)
     events.sort(key=lambda e: e.get("score", 0), reverse=True)
@@ -391,11 +74,6 @@ async def scrape_meetup(page: Page) -> list[dict]:
     logger.info(f"Meetup: total unique events: {len(events)}")
     return events
 
-
-
-
-
-# ─── Luma Scraper ─────────────────────────────────────────────────────────────
 
 async def scrape_luma(page: Page) -> list[dict]:
     events = []
@@ -410,12 +88,10 @@ async def scrape_luma(page: Page) -> list[dict]:
 
     await asyncio.sleep(random_delay(3, 5))
 
-    # scroll to load more
     for i in range(4):
         await page.evaluate("window.scrollBy(0, 800)")
         await asyncio.sleep(random_delay(1, 2))
 
-    # collect event links
     links = await page.eval_on_selector_all(
         "a[href*='/event/']",
         "els => els.map(el => ({href: el.href, text: el.innerText.trim()}))",
@@ -443,11 +119,6 @@ async def scrape_luma(page: Page) -> list[dict]:
     logger.info(f"Luma: total unique events: {len(events)}")
     return events
 
-
-
-
-
-# ─── CSV ops ───────────────────────────────────────────────────────────────────
 
 def load_existing_events(filepath: str) -> list[dict]:
     if not os.path.exists(filepath):
@@ -496,8 +167,6 @@ def append_to_csv(filepath: str, events: list[dict], columns: list[str]):
             writer.writerow(row)
 
 
-# ─── Summary ──────────────────────────────────────────────────────────────────
-
 def print_summary(all_events: list[dict]):
     sorted_events = sorted(all_events, key=lambda e: e.get("score", 0), reverse=True)
     print(f"\n{'─'*60}")
@@ -514,14 +183,11 @@ def print_summary(all_events: list[dict]):
     print(f"{'─'*60}")
     print(f" Total new: {len(sorted_events)}")
 
-    # Highlight top pick
     if sorted_events:
         top = sorted_events[0]
         print(f"\n ★ Best match: {top['title']} ({top['platform']}) — Score: {top['score']}")
         print(f"   {top['link']}")
 
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
 
 async def main():
     logging.basicConfig(
@@ -545,7 +211,6 @@ async def main():
             ],
         )
 
-        # Meetup
         try:
             ctx = await create_context(browser)
             page = await ctx.new_page()
@@ -555,7 +220,6 @@ async def main():
         except Exception as e:
             logger.error(f"Meetup failed: {e}")
 
-        # Luma
         try:
             ctx = await create_context(browser)
             page = await ctx.new_page()
@@ -567,12 +231,10 @@ async def main():
 
         await browser.close()
 
-    # Score + sort
     for ev in all_events:
         score_event(ev)
     all_events.sort(key=lambda e: e.get("score", 0), reverse=True)
 
-    # Dedup against existing CSV
     existing = load_existing_events(OUTPUT_FILE)
     new_events = deduplicate_events(all_events, existing)
 
@@ -584,7 +246,6 @@ async def main():
 
     print_summary(all_events)
 
-    # Raise if nothing was found at all (so CI/email alert triggers)
     if not all_events:
         logger.warning("Zero events scraped — sites may have changed layout")
         sys.exit(1)
